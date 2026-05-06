@@ -63,6 +63,52 @@ Stop the VM:
 ./vmctl.sh stop
 ```
 
+## QEMU Source Policy
+
+QEMU source is not copied into this repo by default. The experiments used
+standard QEMU features:
+
+- `memory-backend-ram`
+- `host-nodes=...,policy=bind`
+- guest NUMA nodes
+- KVM acceleration
+- user-mode SSH forwarding
+
+Those are available in normal distro QEMU builds. If a host does not have a
+suitable QEMU, build one locally without committing it:
+
+```bash
+./vmctl.sh build-qemu --ref v9.2.2
+./vmctl.sh boot --qemu-bin ./qemu-build/bin/qemu-system-x86_64 ...
+```
+
+Generated QEMU source/build directories are ignored by git.
+
+## Supported Feature Matrix
+
+| Feature | Supported | Command |
+| --- | --- | --- |
+| Dependency and NUMA topology check | yes | `check` |
+| Empty qcow2 creation | yes | `create-image --size` |
+| Overlay qcow2 from a base image | yes | `create-image --overlay-from` |
+| Ubuntu cloud image download | yes | `create-image --download` |
+| Local QEMU source clone/build | yes | `build-qemu` |
+| Kernel/module build and dracut initrd creation | yes | `build-initrd` |
+| KVM/TCG selection | yes | `boot --accel` |
+| Kernel/initrd/direct rootfs boot | yes | `boot --kernel --initrd --rootfs` |
+| Corrected host DRAM/CXL binding | yes | `boot --fast-host-node --slow-host-node` |
+| QEMU CPU pinning | yes | `boot --host-cpus` |
+| QMP socket, pidfile, serial log | yes | `boot`, `status` |
+| SSH wait and login | yes | `wait-ssh`, `ssh` |
+| Guest debugfs/cgroup/demotion prep | yes | `prepare-guest` |
+| Upload/download helper | yes | `copy-to`, `copy-from` |
+| Guest tmux background command | yes | `tmux-run` |
+| Workload-specific matrix sweeps | no | keep in workload repos |
+| Large rootfs/ISO storage | no | generated or supplied locally |
+
+The intent is that VM placement is reusable here, while experiment policy
+remains in the benchmark-specific repository.
+
 ## Corrected Default Topology
 
 The default `boot` topology is:
@@ -105,4 +151,27 @@ Run a command in the guest:
 
 ```bash
 ./vmctl.sh ssh --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023 -- 'numactl -H'
+```
+
+Prepare common guest knobs:
+
+```bash
+./vmctl.sh prepare-guest \
+  --ssh-key /tmp/reuse_vm_g28/id_rsa \
+  --ssh-port 10023 \
+  --global-numa-balancing 2 \
+  --demotion-enabled true \
+  --demotion-target '0 1' \
+  --scan-size-mb 256
+```
+
+Run a long guest command under tmux:
+
+```bash
+./vmctl.sh tmux-run \
+  --ssh-key /tmp/reuse_vm_g28/id_rsa \
+  --ssh-port 10023 \
+  --session perf_cap_sweep \
+  --log /tmp/perf_cap_sweep_tmux.log \
+  -- 'bash /root/run_perf_cap_sweep_inner.sh'
 ```

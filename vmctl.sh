@@ -33,9 +33,15 @@ Usage:
 Commands:
   check             Check host dependencies and NUMA topology.
   create-image      Create/download a rootfs artifact under images/.
+  build-qemu        Clone/build a local QEMU binary without committing it.
+  build-initrd      Build kernel/modules and create a dracut initramfs.
   boot              Boot a QEMU VM with DRAM/CXL-style NUMA placement.
   wait-ssh          Wait until the guest SSH endpoint is reachable.
   ssh               Open SSH or run a command in the guest.
+  copy-to           Copy local files into the guest.
+  copy-from         Copy guest files back to the host.
+  prepare-guest     Mount debugfs and set common NUMA/demotion knobs.
+  tmux-run          Start a long guest command in a tmux session.
   status            Print pidfile, QEMU process, and recent logs.
   stop              Stop the daemonized VM.
   verify-placement  Print host QEMU affinity/numastat and guest NUMA topology.
@@ -51,7 +57,10 @@ Boot defaults:
 Examples:
   ./vmctl.sh check
   ./vmctl.sh create-image --overlay-from /vm/base.qcow2 --output images/ubuntu.overlay.qcow2
+  ./vmctl.sh build-qemu --ref v9.2.2
   ./vmctl.sh boot --kernel /path/bzImage --initrd /boot/initrd.img-6.18.0modified --rootfs images/ubuntu.overlay.qcow2
+  ./vmctl.sh prepare-guest --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023 --scan-size-mb 256
+  ./vmctl.sh tmux-run --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023 --session exp -- 'bash /root/run.sh'
   ./vmctl.sh wait-ssh --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023
   ./vmctl.sh verify-placement --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023
 EOF
@@ -129,6 +138,28 @@ append_ssh_key_opt() {
   elif [[ -n "${key}" && "${explicit}" == "1" ]]; then
     die "SSH key not found: ${key}"
   fi
+}
+
+run_cmd() {
+  printf '+ '
+  printf '%q ' "$@"
+  printf '\n'
+  "$@"
+}
+
+run_or_print() {
+  local dry_run="$1"
+  shift
+  printf '+ '
+  printf '%q ' "$@"
+  printf '\n'
+  if [[ "${dry_run}" != "1" ]]; then
+    "$@"
+  fi
+}
+
+q() {
+  printf '%q' "$1"
 }
 
 cmd_check() {
@@ -245,6 +276,174 @@ EOF
     log "creating empty qcow2 image ${output} size=${size}"
     qemu-img create -f qcow2 "${output}" "${size}"
   fi
+}
+
+cmd_build_qemu() {
+  local repo="https://gitlab.com/qemu-project/qemu.git"
+  local ref="v9.2.2"
+  local src="${SCRIPT_DIR}/qemu-src"
+  local prefix="${SCRIPT_DIR}/qemu-build"
+  local jobs
+  local target_list="x86_64-softmmu"
+  local dry_run="0"
+  local configure_only="0"
+  local -a configure_extra=()
+
+  jobs="$(nproc 2>/dev/null || echo 8)"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo) require_value "$1" "${2:-}"; repo="$2"; shift 2 ;;
+      --ref) require_value "$1" "${2:-}"; ref="$2"; shift 2 ;;
+      --src) require_value "$1" "${2:-}"; src="$2"; shift 2 ;;
+      --prefix) require_value "$1" "${2:-}"; prefix="$2"; shift 2 ;;
+      --jobs|-j) require_value "$1" "${2:-}"; jobs="$2"; shift 2 ;;
+      --target-list) require_value "$1" "${2:-}"; target_list="$2"; shift 2 ;;
+      --configure-extra) require_value "$1" "${2:-}"; configure_extra+=( "$2" ); shift 2 ;;
+      --configure-only) configure_only="1"; shift ;;
+      --dry-run) dry_run="1"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  vmctl.sh build-qemu [options]
+
+Options:
+  --repo URL             QEMU git repo (default: upstream GitLab)
+  --ref REF              QEMU tag/branch/commit (default: v9.2.2)
+  --src DIR              Source directory (default: ./qemu-src)
+  --prefix DIR           Install prefix (default: ./qemu-build)
+  --target-list LIST     Configure target list (default: x86_64-softmmu)
+  --configure-extra ARG  Extra configure argument, repeatable
+  --configure-only       Stop after configure
+  --dry-run              Print commands only
+EOF
+        exit 0 ;;
+      *) die "unknown build-qemu option: $1" ;;
+    esac
+  done
+
+  for cmd in git python3; do
+    have_cmd "${cmd}" || die "${cmd} is required"
+  done
+
+  src="$(abs_path "${src}")"
+  prefix="$(abs_path "${prefix}")"
+
+  if [[ ! -d "${src}/.git" ]]; then
+    run_or_print "${dry_run}" git clone "${repo}" "${src}"
+  fi
+
+  run_or_print "${dry_run}" git -C "${src}" fetch --tags origin
+  run_or_print "${dry_run}" git -C "${src}" checkout "${ref}"
+  run_or_print "${dry_run}" git -C "${src}" submodule update --init --recursive
+  run_or_print "${dry_run}" mkdir -p "${src}/build"
+
+  local -a configure_cmd=(
+    "${src}/configure"
+    "--target-list=${target_list}"
+    "--prefix=${prefix}"
+    --disable-docs
+  )
+  configure_cmd+=( "${configure_extra[@]}" )
+  printf '+ cd %q && ' "${src}/build"
+  printf '%q ' "${configure_cmd[@]}"
+  printf '\n'
+  if [[ "${dry_run}" != "1" ]]; then
+    (cd "${src}/build" && "${configure_cmd[@]}")
+  fi
+
+  if [[ "${configure_only}" == "1" ]]; then
+    return 0
+  fi
+
+  if have_cmd ninja; then
+    run_or_print "${dry_run}" ninja -C "${src}/build" -j"${jobs}"
+    run_or_print "${dry_run}" ninja -C "${src}/build" install
+  else
+    have_cmd make || die "ninja or make is required"
+    run_or_print "${dry_run}" make -C "${src}/build" -j"${jobs}"
+    run_or_print "${dry_run}" make -C "${src}/build" install
+  fi
+
+  log "QEMU binary: ${prefix}/bin/qemu-system-x86_64"
+}
+
+cmd_build_initrd() {
+  local kernel_dir="" artifact_dir="${SCRIPT_DIR}/kernel-artifacts"
+  local jobs dracut_bin="dracut" hostonly="0" strip_modules="1"
+  local initrd_name="" dry_run="0"
+
+  jobs="$(nproc 2>/dev/null || echo 8)"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --kernel-dir) require_value "$1" "${2:-}"; kernel_dir="$2"; shift 2 ;;
+      --artifact-dir) require_value "$1" "${2:-}"; artifact_dir="$2"; shift 2 ;;
+      --jobs|-j) require_value "$1" "${2:-}"; jobs="$2"; shift 2 ;;
+      --dracut-bin) require_value "$1" "${2:-}"; dracut_bin="$2"; shift 2 ;;
+      --hostonly) hostonly="1"; shift ;;
+      --strip-modules) strip_modules="1"; shift ;;
+      --no-strip-modules) strip_modules="0"; shift ;;
+      --initrd-name) require_value "$1" "${2:-}"; initrd_name="$2"; shift 2 ;;
+      --dry-run) dry_run="1"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  vmctl.sh build-initrd --kernel-dir /path/linux [options]
+
+Builds bzImage/modules, installs modules into a temporary staging directory,
+and creates a dracut initramfs under ./kernel-artifacts by default.
+EOF
+        exit 0 ;;
+      *) die "unknown build-initrd option: $1" ;;
+    esac
+  done
+
+  [[ -n "${kernel_dir}" ]] || die "--kernel-dir is required"
+  if [[ "${dry_run}" != "1" ]]; then
+    [[ -d "${kernel_dir}" ]] || die "kernel dir not found: ${kernel_dir}"
+    have_cmd "${dracut_bin}" || die "dracut binary not found: ${dracut_bin}"
+  fi
+
+  local kernel_dir_abs artifact_dir_abs mod_stage krel initrd_path
+  kernel_dir_abs="$(abs_path "${kernel_dir}")"
+  artifact_dir_abs="$(abs_path "${artifact_dir}")"
+  mod_stage="${artifact_dir_abs}/mod-stage"
+
+  run_or_print "${dry_run}" mkdir -p "${artifact_dir_abs}"
+  run_or_print "${dry_run}" rm -rf "${mod_stage}"
+  run_or_print "${dry_run}" mkdir -p "${mod_stage}"
+  run_or_print "${dry_run}" make -C "${kernel_dir_abs}" -j"${jobs}" bzImage modules
+
+  if [[ "${dry_run}" == "1" ]]; then
+    krel="<kernelrelease>"
+  else
+    krel="$(make -s -C "${kernel_dir_abs}" kernelrelease)"
+  fi
+
+  if [[ -z "${initrd_name}" ]]; then
+    initrd_name="initramfs-${krel}.img"
+  fi
+  initrd_path="${artifact_dir_abs}/${initrd_name}"
+
+  if [[ "${strip_modules}" == "1" ]]; then
+    run_or_print "${dry_run}" make -C "${kernel_dir_abs}" modules_install INSTALL_MOD_PATH="${mod_stage}" INSTALL_MOD_STRIP=1
+  else
+    run_or_print "${dry_run}" make -C "${kernel_dir_abs}" modules_install INSTALL_MOD_PATH="${mod_stage}"
+  fi
+  run_or_print "${dry_run}" depmod -b "${mod_stage}" "${krel}"
+
+  local -a dracut_args=(
+    --force
+    --kver "${krel}"
+    --kmoddir "${mod_stage}/lib/modules/${krel}"
+    --add-drivers "virtio virtio_pci virtio_ring virtio_net e1000 e1000e"
+  )
+  if [[ "${hostonly}" == "0" ]]; then
+    dracut_args+=( --no-hostonly )
+  fi
+  run_or_print "${dry_run}" "${dracut_bin}" "${dracut_args[@]}" "${initrd_path}"
+  log "initrd: ${initrd_path}"
 }
 
 parse_boot_args() {
@@ -524,6 +723,203 @@ cmd_ssh() {
   "${cmd[@]}"
 }
 
+cmd_copy_to() {
+  local user="${DEFAULT_SSH_USER}" port="${DEFAULT_SSH_PORT}"
+  local key="${DEFAULT_SSH_KEY}" key_explicit="0" host="127.0.0.1"
+  local -a paths=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ssh-user|--user) require_value "$1" "${2:-}"; user="$2"; shift 2 ;;
+      --ssh-port|--port) require_value "$1" "${2:-}"; port="$2"; shift 2 ;;
+      --ssh-key|--key) require_value "$1" "${2:-}"; key="$2"; key_explicit="1"; shift 2 ;;
+      --host) require_value "$1" "${2:-}"; host="$2"; shift 2 ;;
+      --) shift; paths+=( "$@" ); break ;;
+      -h|--help)
+        echo "Usage: vmctl.sh copy-to [ssh options] -- SRC... GUEST_DST"
+        exit 0 ;;
+      *) paths+=( "$1" ); shift ;;
+    esac
+  done
+
+  (( ${#paths[@]} >= 2 )) || die "copy-to requires SRC... and GUEST_DST"
+  local dst="${paths[$((${#paths[@]} - 1))]}"
+  local -a srcs=( "${paths[@]:0:$((${#paths[@]} - 1))}" )
+  local -a cmd=( scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "${port}" )
+  append_ssh_key_opt "${key}" "${key_explicit}" cmd
+  cmd+=( "${srcs[@]}" "${user}@${host}:${dst}" )
+  "${cmd[@]}"
+}
+
+cmd_copy_from() {
+  local user="${DEFAULT_SSH_USER}" port="${DEFAULT_SSH_PORT}"
+  local key="${DEFAULT_SSH_KEY}" key_explicit="0" host="127.0.0.1"
+  local -a paths=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ssh-user|--user) require_value "$1" "${2:-}"; user="$2"; shift 2 ;;
+      --ssh-port|--port) require_value "$1" "${2:-}"; port="$2"; shift 2 ;;
+      --ssh-key|--key) require_value "$1" "${2:-}"; key="$2"; key_explicit="1"; shift 2 ;;
+      --host) require_value "$1" "${2:-}"; host="$2"; shift 2 ;;
+      --) shift; paths+=( "$@" ); break ;;
+      -h|--help)
+        echo "Usage: vmctl.sh copy-from [ssh options] -- GUEST_SRC... LOCAL_DST"
+        exit 0 ;;
+      *) paths+=( "$1" ); shift ;;
+    esac
+  done
+
+  (( ${#paths[@]} >= 2 )) || die "copy-from requires GUEST_SRC... and LOCAL_DST"
+  local dst="${paths[$((${#paths[@]} - 1))]}"
+  local -a srcs=()
+  local i
+  for ((i = 0; i < ${#paths[@]} - 1; i++)); do
+    srcs+=( "${user}@${host}:${paths[$i]}" )
+  done
+  local -a cmd=( scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "${port}" )
+  append_ssh_key_opt "${key}" "${key_explicit}" cmd
+  cmd+=( "${srcs[@]}" "${dst}" )
+  "${cmd[@]}"
+}
+
+cmd_prepare_guest() {
+  local user="${DEFAULT_SSH_USER}" port="${DEFAULT_SSH_PORT}"
+  local key="${DEFAULT_SSH_KEY}" key_explicit="0" host="127.0.0.1"
+  local mount_debugfs="1" cgroup_memory="1"
+  local global_numa="" demotion_enabled="" demotion_target=""
+  local scan_size_mb="" reuse_time_enable=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ssh-user|--user) require_value "$1" "${2:-}"; user="$2"; shift 2 ;;
+      --ssh-port|--port) require_value "$1" "${2:-}"; port="$2"; shift 2 ;;
+      --ssh-key|--key) require_value "$1" "${2:-}"; key="$2"; key_explicit="1"; shift 2 ;;
+      --host) require_value "$1" "${2:-}"; host="$2"; shift 2 ;;
+      --global-numa-balancing) require_value "$1" "${2:-}"; global_numa="$2"; shift 2 ;;
+      --demotion-enabled) require_value "$1" "${2:-}"; demotion_enabled="$2"; shift 2 ;;
+      --demotion-target) require_value "$1" "${2:-}"; demotion_target="$2"; shift 2 ;;
+      --scan-size-mb) require_value "$1" "${2:-}"; scan_size_mb="$2"; shift 2 ;;
+      --reuse-time-enable) require_value "$1" "${2:-}"; reuse_time_enable="$2"; shift 2 ;;
+      --no-debugfs) mount_debugfs="0"; shift ;;
+      --no-cgroup-memory) cgroup_memory="0"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  vmctl.sh prepare-guest [ssh options] [guest knob options]
+
+Options:
+  --global-numa-balancing N   Write /proc/sys/kernel/numa_balancing.
+  --demotion-enabled VALUE    Write /sys/kernel/mm/numa/demotion_enabled.
+  --demotion-target "A B"     Write /sys/kernel/mm/numa/demotion_target.
+  --scan-size-mb N            Write debugfs sched scan_size_mb if present.
+  --reuse-time-enable 0|1     Write debugfs reuse_time/enable if present.
+EOF
+        exit 0 ;;
+      *) die "unknown prepare-guest option: $1" ;;
+    esac
+  done
+
+  local -a ssh_args=( --ssh-user "${user}" --ssh-port "${port}" --host "${host}" )
+  if [[ -f "${key}" || "${key_explicit}" == "1" ]]; then
+    ssh_args+=( --ssh-key "${key}" )
+  fi
+
+  local remote_cmd="MOUNT_DEBUGFS=$(q "${mount_debugfs}") CGROUP_MEMORY=$(q "${cgroup_memory}") GLOBAL_NUMA_BALANCING=$(q "${global_numa}") DEMOTION_ENABLED=$(q "${demotion_enabled}") DEMOTION_TARGET=$(q "${demotion_target}") SCAN_SIZE_MB=$(q "${scan_size_mb}") REUSE_TIME_ENABLE=$(q "${reuse_time_enable}") bash -s"
+  cmd_ssh "${ssh_args[@]}" -- "${remote_cmd}" <<'EOS'
+set -euo pipefail
+
+if [[ "${MOUNT_DEBUGFS}" == "1" ]]; then
+  mkdir -p /sys/kernel/debug
+  mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug
+fi
+
+if [[ "${CGROUP_MEMORY}" == "1" && -w /sys/fs/cgroup/cgroup.subtree_control ]]; then
+  printf '+memory\n' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+fi
+
+if [[ -n "${GLOBAL_NUMA_BALANCING}" && -w /proc/sys/kernel/numa_balancing ]]; then
+  echo "${GLOBAL_NUMA_BALANCING}" > /proc/sys/kernel/numa_balancing
+fi
+
+if [[ -n "${DEMOTION_ENABLED}" && -w /sys/kernel/mm/numa/demotion_enabled ]]; then
+  echo "${DEMOTION_ENABLED}" > /sys/kernel/mm/numa/demotion_enabled
+fi
+
+if [[ -n "${DEMOTION_TARGET}" && -w /sys/kernel/mm/numa/demotion_target ]]; then
+  echo "${DEMOTION_TARGET}" > /sys/kernel/mm/numa/demotion_target
+fi
+
+if [[ -n "${SCAN_SIZE_MB}" && -w /sys/kernel/debug/sched/numa_balancing/scan_size_mb ]]; then
+  echo "${SCAN_SIZE_MB}" > /sys/kernel/debug/sched/numa_balancing/scan_size_mb
+fi
+
+if [[ -n "${REUSE_TIME_ENABLE}" && -w /sys/kernel/debug/reuse_time/enable ]]; then
+  echo "${REUSE_TIME_ENABLE}" > /sys/kernel/debug/reuse_time/enable
+fi
+
+echo "[guest] uname: $(uname -a)"
+echo "[guest] numa_balancing: $(cat /proc/sys/kernel/numa_balancing 2>/dev/null || echo NA)"
+echo "[guest] demotion_enabled: $(cat /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || echo NA)"
+echo "[guest] demotion_target: $(tr '\n' ';' < /sys/kernel/mm/numa/demotion_target 2>/dev/null || echo NA)"
+echo "[guest] scan_size_mb: $(cat /sys/kernel/debug/sched/numa_balancing/scan_size_mb 2>/dev/null || echo NA)"
+echo "[guest] reuse_time_enable: $(cat /sys/kernel/debug/reuse_time/enable 2>/dev/null || echo NA)"
+EOS
+}
+
+cmd_tmux_run() {
+  local user="${DEFAULT_SSH_USER}" port="${DEFAULT_SSH_PORT}"
+  local key="${DEFAULT_SSH_KEY}" key_explicit="0" host="127.0.0.1"
+  local session="vm_experiment" remote_log="" kill_existing="1"
+  local dry_run="0"
+  local -a guest_cmd=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ssh-user|--user) require_value "$1" "${2:-}"; user="$2"; shift 2 ;;
+      --ssh-port|--port) require_value "$1" "${2:-}"; port="$2"; shift 2 ;;
+      --ssh-key|--key) require_value "$1" "${2:-}"; key="$2"; key_explicit="1"; shift 2 ;;
+      --host) require_value "$1" "${2:-}"; host="$2"; shift 2 ;;
+      --session) require_value "$1" "${2:-}"; session="$2"; shift 2 ;;
+      --log) require_value "$1" "${2:-}"; remote_log="$2"; shift 2 ;;
+      --no-kill-existing) kill_existing="0"; shift ;;
+      --dry-run) dry_run="1"; shift ;;
+      --) shift; guest_cmd=( "$@" ); break ;;
+      -h|--help)
+        echo "Usage: vmctl.sh tmux-run [ssh options] --session NAME [--log PATH] -- COMMAND..."
+        exit 0 ;;
+      *) guest_cmd+=( "$1" ); shift ;;
+    esac
+  done
+
+  (( ${#guest_cmd[@]} > 0 )) || die "tmux-run requires a guest command after --"
+
+  local -a ssh_args=( --ssh-user "${user}" --ssh-port "${port}" --host "${host}" )
+  if [[ -f "${key}" || "${key_explicit}" == "1" ]]; then
+    ssh_args+=( --ssh-key "${key}" )
+  fi
+
+  local inner remote
+  inner="$(printf '%q ' "${guest_cmd[@]}")"
+  if [[ -n "${remote_log}" ]]; then
+    inner="${inner}2>&1 | tee -a $(q "${remote_log}")"
+  fi
+
+  if [[ "${kill_existing}" == "1" ]]; then
+    remote="tmux has-session -t $(q "${session}") 2>/dev/null && tmux kill-session -t $(q "${session}") || true; tmux new-session -d -s $(q "${session}") -- bash -lc $(q "${inner}")"
+  else
+    remote="tmux new-session -d -s $(q "${session}") -- bash -lc $(q "${inner}")"
+  fi
+
+  if [[ "${dry_run}" == "1" ]]; then
+    printf 'Remote command:\n  %s\n' "${remote}"
+    return 0
+  fi
+
+  cmd_ssh "${ssh_args[@]}" -- "${remote}"
+  log "started tmux session '${session}'"
+}
+
 cmd_status() {
   local name="${DEFAULT_VM_NAME}" pidfile
   while [[ $# -gt 0 ]]; do
@@ -604,9 +1000,15 @@ main() {
     help|-h|--help) usage ;;
     check) cmd_check "$@" ;;
     create-image) cmd_create_image "$@" ;;
+    build-qemu) cmd_build_qemu "$@" ;;
+    build-initrd) cmd_build_initrd "$@" ;;
     boot) cmd_boot "$@" ;;
     wait-ssh) cmd_wait_ssh "$@" ;;
     ssh) cmd_ssh "$@" ;;
+    copy-to) cmd_copy_to "$@" ;;
+    copy-from) cmd_copy_from "$@" ;;
+    prepare-guest) cmd_prepare_guest "$@" ;;
+    tmux-run) cmd_tmux_run "$@" ;;
     status) cmd_status "$@" ;;
     stop) cmd_stop "$@" ;;
     verify-placement) cmd_verify_placement "$@" ;;

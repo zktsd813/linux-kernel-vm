@@ -3,6 +3,10 @@ images/
 run/
 logs/
 artifacts/
+kernel-artifacts/
+qemu-src/
+qemu-build/
+qemu-build-*/
 
 # Large VM artifacts should be generated or supplied locally, not committed.
 *.img
