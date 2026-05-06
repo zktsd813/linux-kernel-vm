@@ -135,6 +135,9 @@ Downloaded/generated images stay under `images/` by default and are ignored.
 
 ## Useful Commands
 
+For the full operational manual, including command options and an end-to-end
+experiment flow, see [USAGE.md](USAGE.md).
+
 Print the QEMU command without running it:
 
 ```bash
