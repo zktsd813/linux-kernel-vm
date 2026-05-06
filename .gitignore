@@ -1,0 +1,25 @@
+# Generated VM state
+images/
+run/
+logs/
+artifacts/
+
+# Large VM artifacts should be generated or supplied locally, not committed.
+*.img
+*.qcow2
+*.raw
+*.iso
+*.vmdk
+*.vdi
+
+# Local credentials and host-specific config
+*.pem
+id_rsa
+id_rsa.pub
+.env
+vm.local.*
+
+# Editor/runtime noise
+*.swp
+*.tmp
+__pycache__/
