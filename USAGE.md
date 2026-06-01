@@ -18,19 +18,16 @@ outside this repo.
 - tmux-based long-running command launch
 - placement verification and VM stop/status
 
-ICCD workload execution is provided by the small `scripts/` set in this repo.
-Use `scripts/stage_workloads_to_vm.sh` from the host and
-`/root/scripts/run_workload_suite_guest.sh` inside the guest instead of creating
-new per-experiment scripts.
+It does not implement workload-specific experiment matrices. Those should stay
+in benchmark repos and use this repo only to boot and prepare the VM.
 
 ## Directory Layout
 
 ```text
-linux-kernel-vm/
+/Serverless/VM/
   vmctl.sh          single entrypoint
   README.md         short overview
   USAGE.md          detailed usage guide
-  scripts/          ICCD ours workload staging/running scripts
   images/           generated or supplied rootfs images, ignored
   run/              pidfiles, serial logs, QMP sockets, ignored
   kernel-artifacts/ generated initrd/module staging, ignored
@@ -325,84 +322,7 @@ This can:
 All guest knob writes are conditional on file existence/writability. Missing
 experimental knobs do not fail the whole command unless SSH itself fails.
 
-## 9. ICCD PR Smoke Test
-
-This is the smallest end-to-end check for the ICCD scripts. It boots a VM with
-8G fast local memory, stages GAPBS PR plus the prebuilt `kron_g28.sg` graph, and
-runs `off` and `ours` once.
-
-Set paths for the target machine:
-
-```bash
-git clone git@github.com:zktsd813/linux-kernel-vm.git
-cd linux-kernel-vm
-
-export QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
-export KERNEL=/path/to/bzImage
-export INITRD=/path/to/initramfs.img
-export ROOTFS=/path/to/ubuntu.img
-export SSH_KEY=/path/to/id_rsa
-export BENCHMARK_DIR=/Serverless/benchmark
-export PORT=10084
-```
-
-Boot and verify placement:
-
-```bash
-./vmctl.sh boot \
-  --qemu-bin "$QEMU_BIN" \
-  --kernel "$KERNEL" \
-  --initrd "$INITRD" \
-  --rootfs "$ROOTFS" \
-  --rootfs-format raw \
-  --ssh-port "$PORT" \
-  --name iccd-pr-script-smoke \
-  --host-cpus 0-31 \
-  --guest-cpus 32 \
-  --guest-node0-cpus 0-31 \
-  --fast-host-node 0 \
-  --slow-host-node 2 \
-  --fast-mem 8G \
-  --slow-mem 160G \
-  --accel kvm
-
-./vmctl.sh wait-ssh --ssh-key "$SSH_KEY" --ssh-port "$PORT"
-
-./vmctl.sh verify-placement \
-  --name iccd-pr-script-smoke \
-  --ssh-key "$SSH_KEY" \
-  --ssh-port "$PORT"
-```
-
-Stage and run:
-
-```bash
-PORT="$PORT" SSH_KEY="$SSH_KEY" WORKLOADS=pr \
-  BENCHMARK_DIR="$BENCHMARK_DIR" ./scripts/stage_workloads_to_vm.sh
-
-./vmctl.sh ssh --ssh-key "$SSH_KEY" --ssh-port "$PORT" -- \
-  'OUTROOT=/root/script-smoke-pr WORKLOADS=pr POLICIES="off ours" \
-   CAPS=physical:0 MODE=matrix PR_ITERATIONS=1 PR_TRIALS=1 \
-   TIMEOUT_SEC=1200 OMP_THREADS=32 WINDOW_SEC=2 MIN_ARM_WINDOWS=1 \
-   MAX_ARM_WINDOWS=2 OBSERVE_WINDOWS=1 \
-   /root/scripts/run_workload_suite_guest.sh'
-
-./vmctl.sh ssh --ssh-key "$SSH_KEY" --ssh-port "$PORT" -- \
-  'cat /root/script-smoke-pr/summary.csv'
-```
-
-Stop the VM:
-
-```bash
-./vmctl.sh stop --name iccd-pr-script-smoke
-```
-
-For full PR experiments, keep the same boot/stage path and set
-`POLICIES="off on ours"`, `PR_ITERATIONS=20`, and the desired local memory by
-changing `--fast-mem` to `8G`, `16G`, or `32G`. Use `CAPS=physical:0` when the
-VM node0 size itself is the local cap.
-
-## 10. Copy Files
+## 9. Copy Files
 
 Upload files:
 
@@ -424,7 +344,7 @@ Download files:
 
 Both commands use recursive `scp`.
 
-## 11. Run Long Experiments in Guest tmux
+## 10. Run Long Experiments in Guest tmux
 
 ```bash
 ./vmctl.sh tmux-run \
@@ -463,7 +383,7 @@ Check from host:
 ./vmctl.sh ssh --ssh-port 10023 -- 'tail -f /tmp/perf_cap_sweep_tmux.log'
 ```
 
-## 12. Status and Stop
+## 11. Status and Stop
 
 Status:
 
@@ -480,10 +400,10 @@ Stop:
 `stop` uses the pidfile under `run/`. It sends `TERM`, waits up to 30 seconds,
 then sends `KILL` if the process is still alive.
 
-## 13. Full Current Experiment Flow
+## 12. Full Current Experiment Flow
 
 ```bash
-cd linux-kernel-vm
+cd /Serverless/VM
 
 ./vmctl.sh check --fast-host-node 0 --slow-host-node 2
 
@@ -575,3 +495,4 @@ Guest node1 is not CXL:
 - host node2 must already be online as system RAM before booting QEMU
 - run `./vmctl.sh check --slow-host-node 2`
 - if node2 has zero memory, online/reconfigure CXL memory on the host first
+
