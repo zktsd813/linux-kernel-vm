@@ -53,13 +53,16 @@ Boot defaults:
   guest CPUs:     32
   guest node0:    CPUs 0-31, 64G
   guest node1:    memory-only, 64G
+  slow mem mode:  host-cxl
 
 Examples:
   ./vmctl.sh check
   ./vmctl.sh create-image --overlay-from /vm/base.qcow2 --output images/ubuntu.overlay.qcow2
   ./vmctl.sh build-qemu --ref v9.2.2
   ./vmctl.sh boot --kernel /path/bzImage --initrd /boot/initrd.img-6.18.0modified --rootfs images/ubuntu.overlay.qcow2
-  ./vmctl.sh prepare-guest --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023 --scan-size-mb 256
+  ./vmctl.sh boot --kernel /path/bzImage --rootfs images/ubuntu.overlay.qcow2 --slow-memory-mode host-cxl
+  ./vmctl.sh boot --kernel /path/bzImage --initrd /path/initramfs.img --rootfs images/ubuntu.overlay.qcow2 --slow-memory-mode qemu-cxl
+  ./vmctl.sh prepare-guest --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023 --scan-size-mb 4096
   ./vmctl.sh tmux-run --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023 --session exp -- 'bash /root/run.sh'
   ./vmctl.sh wait-ssh --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023
   ./vmctl.sh verify-placement --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023
@@ -110,6 +113,33 @@ mib_to_qemu_size() {
   else
     echo "${mib}M"
   fi
+}
+
+expand_host_node_spec() {
+  local spec="$1" part start end node
+  spec="${spec//,/ }"
+  for part in ${spec}; do
+    if [[ "${part}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      (( start <= end )) || die "invalid host node range: ${part}"
+      for ((node = start; node <= end; node++)); do
+        printf '%s\n' "${node}"
+      done
+    elif [[ "${part}" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "${part}"
+    else
+      die "invalid host node spec: ${spec}"
+    fi
+  done
+}
+
+validate_host_node_spec() {
+  local spec="$1" node
+  while read -r node; do
+    [[ -n "${node}" ]] || continue
+    [[ -d "/sys/devices/system/node/node${node}" ]] || die "host node missing: ${node}"
+  done < <(expand_host_node_spec "${spec}")
 }
 
 ssh_opts() {
@@ -203,7 +233,7 @@ cmd_check() {
     done
   fi
 
-  for node in "${fast_node}" "${slow_node}"; do
+  for node in $(expand_host_node_spec "${fast_node}") $(expand_host_node_spec "${slow_node}"); do
     if [[ -d "/sys/devices/system/node/node${node}" ]]; then
       printf '  host node %-5s present\n' "${node}"
     else
@@ -467,6 +497,21 @@ parse_boot_args() {
   FAST_MEM="64G"
   SLOW_MEM="64G"
   TOTAL_MEM=""
+  SLOW_MEMORY_MODE="${SLOW_MEMORY_MODE:-host-cxl}"
+  MEMORY_SLOTS="${MEMORY_SLOTS:-8}"
+  HMAT_FAST_LATENCY_NS="${HMAT_FAST_LATENCY_NS:-80}"
+  HMAT_SLOW_LATENCY_NS="${HMAT_SLOW_LATENCY_NS:-250}"
+  HMAT_FAST_BANDWIDTH="${HMAT_FAST_BANDWIDTH:-40000M}"
+  HMAT_SLOW_BANDWIDTH="${HMAT_SLOW_BANDWIDTH:-10000M}"
+  CXL_FMW_SIZE="${CXL_FMW_SIZE:-}"
+  CXL_BRIDGE_ID="${CXL_BRIDGE_ID:-cxl.1}"
+  CXL_ROOT_PORT_ID="${CXL_ROOT_PORT_ID:-cxl_rp0}"
+  CXL_MEMDEV_ID="${CXL_MEMDEV_ID:-cxlmem0}"
+  CXL_DEVICE_ID="${CXL_DEVICE_ID:-cxl0}"
+  CXL_BUS_NR="${CXL_BUS_NR:-12}"
+  CXL_PORT="${CXL_PORT:-0}"
+  CXL_CHASSIS="${CXL_CHASSIS:-0}"
+  CXL_SLOT="${CXL_SLOT:-2}"
   PREALLOC="1"
   DAEMON="1"
   DRY_RUN="0"
@@ -495,6 +540,23 @@ parse_boot_args() {
       --slow-host-node) require_value "$1" "${2:-}"; SLOW_HOST_NODE="$2"; shift 2 ;;
       --fast-mem) require_value "$1" "${2:-}"; FAST_MEM="$2"; shift 2 ;;
       --slow-mem) require_value "$1" "${2:-}"; SLOW_MEM="$2"; shift 2 ;;
+      --slow-memory-mode|--memory-mode) require_value "$1" "${2:-}"; SLOW_MEMORY_MODE="$2"; shift 2 ;;
+      --host-cxl|--hmat) SLOW_MEMORY_MODE="host-cxl"; shift ;;
+      --qemu-cxl|--cxl) SLOW_MEMORY_MODE="qemu-cxl"; shift ;;
+      --memory-slots) require_value "$1" "${2:-}"; MEMORY_SLOTS="$2"; shift 2 ;;
+      --hmat-fast-latency-ns) require_value "$1" "${2:-}"; HMAT_FAST_LATENCY_NS="$2"; shift 2 ;;
+      --hmat-slow-latency-ns) require_value "$1" "${2:-}"; HMAT_SLOW_LATENCY_NS="$2"; shift 2 ;;
+      --hmat-fast-bandwidth) require_value "$1" "${2:-}"; HMAT_FAST_BANDWIDTH="$2"; shift 2 ;;
+      --hmat-slow-bandwidth) require_value "$1" "${2:-}"; HMAT_SLOW_BANDWIDTH="$2"; shift 2 ;;
+      --cxl-fmw-size) require_value "$1" "${2:-}"; CXL_FMW_SIZE="$2"; shift 2 ;;
+      --cxl-bridge-id) require_value "$1" "${2:-}"; CXL_BRIDGE_ID="$2"; shift 2 ;;
+      --cxl-root-port-id) require_value "$1" "${2:-}"; CXL_ROOT_PORT_ID="$2"; shift 2 ;;
+      --cxl-memdev-id) require_value "$1" "${2:-}"; CXL_MEMDEV_ID="$2"; shift 2 ;;
+      --cxl-device-id) require_value "$1" "${2:-}"; CXL_DEVICE_ID="$2"; shift 2 ;;
+      --cxl-bus-nr) require_value "$1" "${2:-}"; CXL_BUS_NR="$2"; shift 2 ;;
+      --cxl-port) require_value "$1" "${2:-}"; CXL_PORT="$2"; shift 2 ;;
+      --cxl-chassis) require_value "$1" "${2:-}"; CXL_CHASSIS="$2"; shift 2 ;;
+      --cxl-slot) require_value "$1" "${2:-}"; CXL_SLOT="$2"; shift 2 ;;
       --memory) require_value "$1" "${2:-}"; TOTAL_MEM="$2"; shift 2 ;;
       --cmdline) require_value "$1" "${2:-}"; CMDLINE="$2"; shift 2 ;;
       --cmdline-extra) require_value "$1" "${2:-}"; EXTRA_CMDLINE="${EXTRA_CMDLINE} $2"; shift 2 ;;
@@ -521,6 +583,27 @@ select_accel() {
   esac
 }
 
+normalize_slow_memory_mode() {
+  case "${SLOW_MEMORY_MODE}" in
+    numa) ;;
+    host-cxl|hmat|cxl-backed)
+      SLOW_MEMORY_MODE="host-cxl" ;;
+    qemu-cxl|cxl|type3-cxl)
+      SLOW_MEMORY_MODE="qemu-cxl" ;;
+    *)
+      die "--slow-memory-mode must be numa, host-cxl, or qemu-cxl" ;;
+  esac
+}
+
+append_hmat_lb_args() {
+  QEMU_CMD+=(
+    -numa "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=${HMAT_FAST_LATENCY_NS}"
+    -numa "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=${HMAT_FAST_BANDWIDTH}"
+    -numa "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=${HMAT_SLOW_LATENCY_NS}"
+    -numa "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=${HMAT_SLOW_BANDWIDTH}"
+  )
+}
+
 port_in_use() {
   local port="$1"
   if have_cmd ss; then
@@ -532,6 +615,7 @@ port_in_use() {
 
 build_qemu_cmd() {
   local fast_mib slow_mib total_mib cpu_model prealloc_arg serial_log qmp_sock pidfile
+  local machine_arg memory_arg cxl_fmw_mib cxl_fmw_size_arg
 
   [[ -n "${KERNEL_IMAGE}" ]] || die "--kernel is required"
   [[ -n "${ROOTFS_IMAGE}" ]] || die "--rootfs is required"
@@ -540,14 +624,22 @@ build_qemu_cmd() {
     [[ -f "${KERNEL_IMAGE}" ]] || die "kernel not found: ${KERNEL_IMAGE}"
     [[ -f "${ROOTFS_IMAGE}" ]] || die "rootfs not found: ${ROOTFS_IMAGE}"
     [[ -z "${INITRD_IMAGE}" || -f "${INITRD_IMAGE}" ]] || die "initrd not found: ${INITRD_IMAGE}"
-    [[ -d "/sys/devices/system/node/node${FAST_HOST_NODE}" ]] || die "fast host node missing: ${FAST_HOST_NODE}"
-    [[ -d "/sys/devices/system/node/node${SLOW_HOST_NODE}" ]] || die "slow host node missing: ${SLOW_HOST_NODE}"
+    validate_host_node_spec "${FAST_HOST_NODE}"
+    validate_host_node_spec "${SLOW_HOST_NODE}"
   fi
 
   [[ "${ROOTFS_FORMAT}" == "qcow2" || "${ROOTFS_FORMAT}" == "raw" ]] || die "--rootfs-format must be qcow2 or raw"
   [[ "${DRIVE_IF}" == "virtio" || "${DRIVE_IF}" == "ide" || "${DRIVE_IF}" == "scsi" ]] || die "--drive-if must be virtio, ide, or scsi"
   [[ "${NET_DEVICE}" == "virtio-net-pci" || "${NET_DEVICE}" == "e1000" || "${NET_DEVICE}" == "rtl8139" ]] || die "--net-device must be virtio-net-pci, e1000, or rtl8139"
   [[ "${SSH_PORT}" =~ ^[0-9]+$ ]] || die "--ssh-port must be a number"
+  normalize_slow_memory_mode
+  [[ "${MEMORY_SLOTS}" =~ ^[0-9]+$ ]] || die "--memory-slots must be a number"
+  [[ "${HMAT_FAST_LATENCY_NS}" =~ ^[0-9]+$ ]] || die "--hmat-fast-latency-ns must be a number"
+  [[ "${HMAT_SLOW_LATENCY_NS}" =~ ^[0-9]+$ ]] || die "--hmat-slow-latency-ns must be a number"
+  [[ "${CXL_BUS_NR}" =~ ^[0-9]+$ ]] || die "--cxl-bus-nr must be a number"
+  [[ "${CXL_PORT}" =~ ^[0-9]+$ ]] || die "--cxl-port must be a number"
+  [[ "${CXL_CHASSIS}" =~ ^[0-9]+$ ]] || die "--cxl-chassis must be a number"
+  [[ "${CXL_SLOT}" =~ ^[0-9]+$ ]] || die "--cxl-slot must be a number"
 
   select_accel
   if [[ "${DRY_RUN}" != "1" ]] && port_in_use "${SSH_PORT}"; then
@@ -571,6 +663,25 @@ build_qemu_cmd() {
   [[ "${ACCEL}" == "kvm" ]] || cpu_model="max"
   prealloc_arg="prealloc=on"
   [[ "${PREALLOC}" == "1" ]] || prealloc_arg="prealloc=off"
+  machine_arg="q35"
+  memory_arg="$(mib_to_qemu_size "${total_mib}")"
+
+  case "${SLOW_MEMORY_MODE}" in
+    numa)
+      ;;
+    host-cxl)
+      machine_arg="q35,hmat=on"
+      ;;
+    qemu-cxl)
+      [[ -n "${CXL_FMW_SIZE}" ]] || CXL_FMW_SIZE="${SLOW_MEM}"
+      cxl_fmw_mib="$(size_to_mib "${CXL_FMW_SIZE}")"
+      (( cxl_fmw_mib >= slow_mib )) || die "--cxl-fmw-size must be at least --slow-mem"
+      (( cxl_fmw_mib % 256 == 0 )) || die "--cxl-fmw-size must be a multiple of 256M"
+      cxl_fmw_size_arg="$(mib_to_qemu_size "${cxl_fmw_mib}")"
+      machine_arg="q35,cxl=on,hmat=on,cxl-fmw.0.targets.0=${CXL_BRIDGE_ID},cxl-fmw.0.size=${cxl_fmw_size_arg}"
+      memory_arg="$(mib_to_qemu_size "${fast_mib}"),maxmem=$(mib_to_qemu_size "${total_mib}"),slots=${MEMORY_SLOTS}"
+      ;;
+  esac
 
   PIDFILE="${RUN_DIR}/${VM_NAME}.pid"
   SERIAL_LOG="${RUN_DIR}/${VM_NAME}.serial.log"
@@ -581,25 +692,51 @@ build_qemu_cmd() {
     "${QEMU_BIN}"
     -pidfile "${PIDFILE}"
     -name "${VM_NAME}"
-    -machine q35
+    -machine "${machine_arg}"
     -cpu "${cpu_model}"
     -accel "${ACCEL}"
     -smp "${GUEST_CPUS},maxcpus=${GUEST_CPUS}"
-    -m "$(mib_to_qemu_size "${total_mib}")"
+    -m "${memory_arg}"
     -kernel "${KERNEL_IMAGE}"
     -append "${CMDLINE}"
     -drive "file=${ROOTFS_IMAGE},if=${DRIVE_IF},format=${ROOTFS_FORMAT}"
     -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22"
     -device "${NET_DEVICE},netdev=net0"
     -object "memory-backend-ram,id=ram0,size=${FAST_MEM},host-nodes=${FAST_HOST_NODE},policy=bind,${prealloc_arg}"
-    -object "memory-backend-ram,id=ram1,size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,${prealloc_arg}"
     -numa "node,nodeid=0,cpus=${GUEST_NODE0_CPUS},memdev=ram0"
-    -numa "node,nodeid=1,memdev=ram1"
     -display none
     -serial "file:${SERIAL_LOG}"
     -monitor none
     -qmp "unix:${QMP_SOCK},server=on,wait=off"
   )
+
+  case "${SLOW_MEMORY_MODE}" in
+    numa)
+      QEMU_CMD+=(
+        -object "memory-backend-ram,id=ram1,size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,${prealloc_arg}"
+        -numa "node,nodeid=1,memdev=ram1"
+      )
+      ;;
+    host-cxl)
+      QEMU_CMD+=(
+        -object "memory-backend-ram,id=ram1,size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,${prealloc_arg}"
+        -numa "node,nodeid=1,memdev=ram1,initiator=0"
+      )
+      append_hmat_lb_args
+      ;;
+    qemu-cxl)
+      QEMU_CMD+=(
+        -numa "node,nodeid=1,initiator=0"
+      )
+      append_hmat_lb_args
+      QEMU_CMD+=(
+        -object "memory-backend-ram,id=${CXL_MEMDEV_ID},size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,share=on,${prealloc_arg}"
+        -device "pxb-cxl,bus_nr=${CXL_BUS_NR},bus=pcie.0,id=${CXL_BRIDGE_ID},numa_node=1"
+        -device "cxl-rp,port=${CXL_PORT},bus=${CXL_BRIDGE_ID},id=${CXL_ROOT_PORT_ID},chassis=${CXL_CHASSIS},slot=${CXL_SLOT}"
+        -device "cxl-type3,bus=${CXL_ROOT_PORT_ID},volatile-memdev=${CXL_MEMDEV_ID},id=${CXL_DEVICE_ID}"
+      )
+      ;;
+  esac
 
   if [[ -n "${INITRD_IMAGE}" ]]; then
     QEMU_CMD+=( -initrd "${INITRD_IMAGE}" )
@@ -622,6 +759,15 @@ build_qemu_cmd() {
 }
 
 print_boot_plan() {
+  local node1_desc
+  if [[ "${SLOW_MEMORY_MODE}" == "qemu-cxl" ]]; then
+    node1_desc="CXL Type3 volatile, mem=${SLOW_MEM}, host node=${SLOW_HOST_NODE}"
+  elif [[ "${SLOW_MEMORY_MODE}" == "host-cxl" ]]; then
+    node1_desc="memory-only, mem=${SLOW_MEM}, host CXL node=${SLOW_HOST_NODE}, HMAT exposed"
+  else
+    node1_desc="memory-only, mem=${SLOW_MEM}, host node=${SLOW_HOST_NODE}"
+  fi
+
   cat <<EOF
 QEMU launch plan
   qemu       : ${QEMU_BIN}
@@ -633,14 +779,35 @@ QEMU launch plan
   accel      : ${ACCEL}
   host CPUs  : ${HOST_CPUS:-<not pinned>}
   guest CPUs : ${GUEST_CPUS}
+  slow mode  : ${SLOW_MEMORY_MODE}
   node0      : guest cpus=${GUEST_NODE0_CPUS}, mem=${FAST_MEM}, host node=${FAST_HOST_NODE}
-  node1      : memory-only, mem=${SLOW_MEM}, host node=${SLOW_HOST_NODE}
+  node1      : ${node1_desc}
   ssh        : host ${SSH_PORT} -> guest 22
   pidfile    : ${PIDFILE}
   serial log : ${SERIAL_LOG}
   qmp socket : ${QMP_SOCK}
   cmdline    : ${CMDLINE}
+EOF
+  if [[ "${SLOW_MEMORY_MODE}" == "host-cxl" || "${SLOW_MEMORY_MODE}" == "qemu-cxl" ]]; then
+    cat <<EOF
+  hmat       : fast ${HMAT_FAST_LATENCY_NS}ns/${HMAT_FAST_BANDWIDTH}, slow ${HMAT_SLOW_LATENCY_NS}ns/${HMAT_SLOW_BANDWIDTH}
 
+EOF
+  fi
+  if [[ "${SLOW_MEMORY_MODE}" == "qemu-cxl" ]]; then
+    cat <<EOF
+  cxl        : bridge=${CXL_BRIDGE_ID}, root-port=${CXL_ROOT_PORT_ID}, device=${CXL_DEVICE_ID}, fmw=${CXL_FMW_SIZE:-${SLOW_MEM}}
+
+EOF
+    if [[ -z "${INITRD_IMAGE}" ]]; then
+      cat <<'EOF'
+  note       : current kernel config commonly builds CXL drivers as modules; pass an initrd with CXL drivers
+               or build them into the kernel if the guest must online CXL memory during early boot.
+
+EOF
+    fi
+  fi
+  cat <<'EOF'
 Command:
 EOF
   printf '  '
@@ -786,7 +953,7 @@ cmd_copy_from() {
 cmd_prepare_guest() {
   local user="${DEFAULT_SSH_USER}" port="${DEFAULT_SSH_PORT}"
   local key="${DEFAULT_SSH_KEY}" key_explicit="0" host="127.0.0.1"
-  local mount_debugfs="1" cgroup_memory="1"
+  local mount_debugfs="1"
   local global_numa="" demotion_enabled="" demotion_target=""
   local scan_size_mb="" reuse_time_enable=""
 
@@ -802,7 +969,6 @@ cmd_prepare_guest() {
       --scan-size-mb) require_value "$1" "${2:-}"; scan_size_mb="$2"; shift 2 ;;
       --reuse-time-enable) require_value "$1" "${2:-}"; reuse_time_enable="$2"; shift 2 ;;
       --no-debugfs) mount_debugfs="0"; shift ;;
-      --no-cgroup-memory) cgroup_memory="0"; shift ;;
       -h|--help)
         cat <<'EOF'
 Usage:
@@ -825,17 +991,13 @@ EOF
     ssh_args+=( --ssh-key "${key}" )
   fi
 
-  local remote_cmd="MOUNT_DEBUGFS=$(q "${mount_debugfs}") CGROUP_MEMORY=$(q "${cgroup_memory}") GLOBAL_NUMA_BALANCING=$(q "${global_numa}") DEMOTION_ENABLED=$(q "${demotion_enabled}") DEMOTION_TARGET=$(q "${demotion_target}") SCAN_SIZE_MB=$(q "${scan_size_mb}") REUSE_TIME_ENABLE=$(q "${reuse_time_enable}") bash -s"
+  local remote_cmd="MOUNT_DEBUGFS=$(q "${mount_debugfs}") GLOBAL_NUMA_BALANCING=$(q "${global_numa}") DEMOTION_ENABLED=$(q "${demotion_enabled}") DEMOTION_TARGET=$(q "${demotion_target}") SCAN_SIZE_MB=$(q "${scan_size_mb}") REUSE_TIME_ENABLE=$(q "${reuse_time_enable}") bash -s"
   cmd_ssh "${ssh_args[@]}" -- "${remote_cmd}" <<'EOS'
 set -euo pipefail
 
 if [[ "${MOUNT_DEBUGFS}" == "1" ]]; then
   mkdir -p /sys/kernel/debug
   mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug
-fi
-
-if [[ "${CGROUP_MEMORY}" == "1" && -w /sys/fs/cgroup/cgroup.subtree_control ]]; then
-  printf '+memory\n' > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
 fi
 
 if [[ -n "${GLOBAL_NUMA_BALANCING}" && -w /proc/sys/kernel/numa_balancing ]]; then
