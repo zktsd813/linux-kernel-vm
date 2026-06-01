@@ -12,8 +12,9 @@ The script distills the reusable parts from the existing experiment tree:
 - `reuse_time/docs/cxl-hotset-perf-analysis-20260506.md`: corrected CXL-backed placement, where guest node0 is host node0 DRAM and guest node1 is host node2 CXL.
 - `reuse_time/vm/prepare_vm.sh`: guest-side debugfs/module preparation assumptions.
 
-Workload-specific runners are not copied here. Use this repo to boot a correctly
-placed VM, then run experiment-specific scripts from their own repos.
+The ICCD workload runners are kept under `scripts/` as a small reusable set.
+Do not add per-experiment one-off runners; boot and stage through this repo,
+then select workloads with environment variables.
 
 ## Quick Start
 
@@ -103,11 +104,91 @@ Generated QEMU source/build directories are ignored by git.
 | Guest debugfs/cgroup/demotion prep | yes | `prepare-guest` |
 | Upload/download helper | yes | `copy-to`, `copy-from` |
 | Guest tmux background command | yes | `tmux-run` |
-| Workload-specific matrix sweeps | no | keep in workload repos |
+| ICCD workload matrix sweeps | yes | `scripts/run_workload_suite_guest.sh` |
 | Large rootfs/ISO storage | no | generated or supplied locally |
 
-The intent is that VM placement is reusable here, while experiment policy
-remains in the benchmark-specific repository.
+## ICCD Ours Scripts
+
+The active workload-side entrypoints are:
+
+- `scripts/stage_workloads_to_vm.sh`: host-side staging into a live VM
+- `scripts/run_workload_suite_guest.sh`: guest-side matrix/calibration runner
+- `scripts/run_ours_experiment.sh`: one workload under `off`, `on`, or `ours`
+- `scripts/run_workload_case_guest.sh`: real-world workload commands/profiles
+- `scripts/local_util_adapt_controller.py`: local-fault controller
+
+Example staging and run:
+
+```bash
+PORT=10064 WORKLOADS=scalable ./scripts/stage_workloads_to_vm.sh
+
+./vmctl.sh tmux-run --ssh-port 10064 --session rss60 -- \
+  'OUTROOT=/root/rss60-8g WORKLOADS=scalable POLICIES="off on ours" MODE=matrix /root/scripts/run_workload_suite_guest.sh'
+```
+
+The intent is that VM placement and workload policy are both reusable here,
+with workload selection controlled through environment variables.
+
+## ICCD PR Smoke Test
+
+From a fresh machine, clone this repo and point these variables at local
+artifacts. The rootfs, kernel, initrd, SSH key, and benchmark cache are supplied
+locally and are intentionally not committed.
+
+```bash
+git clone git@github.com:zktsd813/linux-kernel-vm.git
+cd linux-kernel-vm
+
+export QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+export KERNEL=/path/to/bzImage
+export INITRD=/path/to/initramfs.img
+export ROOTFS=/path/to/ubuntu.img
+export SSH_KEY=/path/to/id_rsa
+export BENCHMARK_DIR=/Serverless/benchmark
+export PORT=10084
+
+./vmctl.sh boot \
+  --qemu-bin "$QEMU_BIN" \
+  --kernel "$KERNEL" \
+  --initrd "$INITRD" \
+  --rootfs "$ROOTFS" \
+  --rootfs-format raw \
+  --ssh-port "$PORT" \
+  --name iccd-pr-script-smoke \
+  --host-cpus 0-31 \
+  --guest-cpus 32 \
+  --guest-node0-cpus 0-31 \
+  --fast-host-node 0 \
+  --slow-host-node 2 \
+  --fast-mem 8G \
+  --slow-mem 160G \
+  --accel kvm
+
+./vmctl.sh wait-ssh --ssh-key "$SSH_KEY" --ssh-port "$PORT"
+./vmctl.sh verify-placement --ssh-key "$SSH_KEY" --ssh-port "$PORT" \
+  --name iccd-pr-script-smoke
+
+PORT="$PORT" SSH_KEY="$SSH_KEY" WORKLOADS=pr \
+  BENCHMARK_DIR="$BENCHMARK_DIR" ./scripts/stage_workloads_to_vm.sh
+
+./vmctl.sh ssh --ssh-key "$SSH_KEY" --ssh-port "$PORT" -- \
+  'OUTROOT=/root/script-smoke-pr WORKLOADS=pr POLICIES="off ours" \
+   CAPS=physical:0 MODE=matrix PR_ITERATIONS=1 PR_TRIALS=1 \
+   TIMEOUT_SEC=1200 OMP_THREADS=32 WINDOW_SEC=2 MIN_ARM_WINDOWS=1 \
+   MAX_ARM_WINDOWS=2 OBSERVE_WINDOWS=1 \
+   /root/scripts/run_workload_suite_guest.sh'
+
+./vmctl.sh ssh --ssh-key "$SSH_KEY" --ssh-port "$PORT" -- \
+  'cat /root/script-smoke-pr/summary.csv'
+
+./vmctl.sh stop --name iccd-pr-script-smoke
+```
+
+For full PR runs, use the same flow with `POLICIES="off on ours"`,
+`PR_ITERATIONS=20`, and the desired `--fast-mem` value such as `8G`, `16G`, or
+`32G`. The GAPBS graph should already exist at
+`${BENCHMARK_DIR}/gapbs/benchmark/graphs/kron_g28.sg`; the staging script copies
+it into the guest as `/root/gapbs_graphs/kron_g28.sg`.
 
 ## Corrected Default Topology
 
