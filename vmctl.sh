@@ -54,6 +54,7 @@ Boot defaults:
   guest node0:    CPUs 0-31, 64G
   guest node1:    memory-only, 64G
   slow mem mode:  host-cxl
+  4-node smoke:   --topology two-socket-cxl
 
 Examples:
   ./vmctl.sh check
@@ -62,6 +63,7 @@ Examples:
   ./vmctl.sh boot --kernel /path/bzImage --initrd /boot/initrd.img-6.18.0modified --rootfs images/ubuntu.overlay.qcow2
   ./vmctl.sh boot --kernel /path/bzImage --rootfs images/ubuntu.overlay.qcow2 --slow-memory-mode host-cxl
   ./vmctl.sh boot --kernel /path/bzImage --initrd /path/initramfs.img --rootfs images/ubuntu.overlay.qcow2 --slow-memory-mode qemu-cxl
+  ./vmctl.sh boot --topology two-socket-cxl --kernel /path/bzImage --rootfs images/ubuntu.overlay.qcow2
   ./vmctl.sh prepare-guest --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023 --scan-size-mb 4096
   ./vmctl.sh tmux-run --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023 --session exp -- 'bash /root/run.sh'
   ./vmctl.sh wait-ssh --ssh-key /tmp/reuse_vm_g28/id_rsa --ssh-port 10023
@@ -489,13 +491,23 @@ parse_boot_args() {
   VM_NAME="${DEFAULT_VM_NAME}"
   SSH_KEY="${DEFAULT_SSH_KEY}"
   ACCEL="auto"
+  TOPOLOGY="two-node"
   HOST_CPUS="0-31"
   GUEST_CPUS="32"
   GUEST_NODE0_CPUS="0-31"
+  GUEST_NODE1_CPUS=""
   FAST_HOST_NODE="0"
   SLOW_HOST_NODE="2"
   FAST_MEM="64G"
   SLOW_MEM="64G"
+  NODE0_HOST_NODE=""
+  NODE1_HOST_NODE=""
+  NODE2_HOST_NODE=""
+  NODE3_HOST_NODE=""
+  NODE0_MEM=""
+  NODE1_MEM=""
+  NODE2_MEM=""
+  NODE3_MEM=""
   TOTAL_MEM=""
   SLOW_MEMORY_MODE="${SLOW_MEMORY_MODE:-host-cxl}"
   MEMORY_SLOTS="${MEMORY_SLOTS:-8}"
@@ -533,13 +545,23 @@ parse_boot_args() {
       --ssh-key) require_value "$1" "${2:-}"; SSH_KEY="$2"; shift 2 ;;
       --name) require_value "$1" "${2:-}"; VM_NAME="$2"; shift 2 ;;
       --accel) require_value "$1" "${2:-}"; ACCEL="$2"; shift 2 ;;
+      --topology) require_value "$1" "${2:-}"; TOPOLOGY="$2"; shift 2 ;;
       --host-cpus) require_value "$1" "${2:-}"; HOST_CPUS="$2"; shift 2 ;;
       --guest-cpus) require_value "$1" "${2:-}"; GUEST_CPUS="$2"; shift 2 ;;
       --guest-node0-cpus) require_value "$1" "${2:-}"; GUEST_NODE0_CPUS="$2"; shift 2 ;;
+      --guest-node1-cpus) require_value "$1" "${2:-}"; GUEST_NODE1_CPUS="$2"; shift 2 ;;
       --fast-host-node) require_value "$1" "${2:-}"; FAST_HOST_NODE="$2"; shift 2 ;;
       --slow-host-node) require_value "$1" "${2:-}"; SLOW_HOST_NODE="$2"; shift 2 ;;
       --fast-mem) require_value "$1" "${2:-}"; FAST_MEM="$2"; shift 2 ;;
       --slow-mem) require_value "$1" "${2:-}"; SLOW_MEM="$2"; shift 2 ;;
+      --node0-host-node) require_value "$1" "${2:-}"; NODE0_HOST_NODE="$2"; shift 2 ;;
+      --node1-host-node) require_value "$1" "${2:-}"; NODE1_HOST_NODE="$2"; shift 2 ;;
+      --node2-host-node) require_value "$1" "${2:-}"; NODE2_HOST_NODE="$2"; shift 2 ;;
+      --node3-host-node) require_value "$1" "${2:-}"; NODE3_HOST_NODE="$2"; shift 2 ;;
+      --node0-mem) require_value "$1" "${2:-}"; NODE0_MEM="$2"; shift 2 ;;
+      --node1-mem) require_value "$1" "${2:-}"; NODE1_MEM="$2"; shift 2 ;;
+      --node2-mem) require_value "$1" "${2:-}"; NODE2_MEM="$2"; shift 2 ;;
+      --node3-mem) require_value "$1" "${2:-}"; NODE3_MEM="$2"; shift 2 ;;
       --slow-memory-mode|--memory-mode) require_value "$1" "${2:-}"; SLOW_MEMORY_MODE="$2"; shift 2 ;;
       --host-cxl|--hmat) SLOW_MEMORY_MODE="host-cxl"; shift ;;
       --qemu-cxl|--cxl) SLOW_MEMORY_MODE="qemu-cxl"; shift ;;
@@ -595,6 +617,29 @@ normalize_slow_memory_mode() {
   esac
 }
 
+normalize_topology() {
+  case "${TOPOLOGY}" in
+    two-node|default) TOPOLOGY="two-node" ;;
+    two-socket-cxl|4node|four-node) TOPOLOGY="two-socket-cxl" ;;
+    *) die "--topology must be two-node or two-socket-cxl" ;;
+  esac
+}
+
+apply_two_socket_cxl_defaults() {
+  [[ -n "${HOST_CPUS}" && "${HOST_CPUS}" != "0-31" ]] || HOST_CPUS="0-15"
+  [[ -n "${GUEST_CPUS}" && "${GUEST_CPUS}" != "32" ]] || GUEST_CPUS="16"
+  [[ -n "${GUEST_NODE0_CPUS}" && "${GUEST_NODE0_CPUS}" != "0-31" ]] || GUEST_NODE0_CPUS="0-7"
+  [[ -n "${GUEST_NODE1_CPUS}" ]] || GUEST_NODE1_CPUS="8-15"
+  [[ -n "${NODE0_HOST_NODE}" ]] || NODE0_HOST_NODE="${FAST_HOST_NODE:-0}"
+  [[ -n "${NODE1_HOST_NODE}" ]] || NODE1_HOST_NODE="1"
+  [[ -n "${NODE2_HOST_NODE}" ]] || NODE2_HOST_NODE="${SLOW_HOST_NODE:-2}"
+  [[ -n "${NODE3_HOST_NODE}" ]] || NODE3_HOST_NODE="3"
+  [[ -n "${NODE0_MEM}" ]] || NODE0_MEM="4G"
+  [[ -n "${NODE1_MEM}" ]] || NODE1_MEM="4G"
+  [[ -n "${NODE2_MEM}" ]] || NODE2_MEM="4G"
+  [[ -n "${NODE3_MEM}" ]] || NODE3_MEM="4G"
+}
+
 append_hmat_lb_args() {
   QEMU_CMD+=(
     -numa "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=${HMAT_FAST_LATENCY_NS}"
@@ -602,6 +647,26 @@ append_hmat_lb_args() {
     -numa "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=${HMAT_SLOW_LATENCY_NS}"
     -numa "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=${HMAT_SLOW_BANDWIDTH}"
   )
+}
+
+append_hmat_lb_args_two_socket_cxl() {
+  local initiator target latency bandwidth
+
+  for initiator in 0 1; do
+    for target in 0 1 2 3; do
+      if (( target < 2 )); then
+        latency="${HMAT_FAST_LATENCY_NS}"
+        bandwidth="${HMAT_FAST_BANDWIDTH}"
+      else
+        latency="${HMAT_SLOW_LATENCY_NS}"
+        bandwidth="${HMAT_SLOW_BANDWIDTH}"
+      fi
+      QEMU_CMD+=(
+        -numa "hmat-lb,initiator=${initiator},target=${target},hierarchy=memory,data-type=access-latency,latency=${latency}"
+        -numa "hmat-lb,initiator=${initiator},target=${target},hierarchy=memory,data-type=access-bandwidth,bandwidth=${bandwidth}"
+      )
+    done
+  done
 }
 
 port_in_use() {
@@ -616,6 +681,7 @@ port_in_use() {
 build_qemu_cmd() {
   local fast_mib slow_mib total_mib cpu_model prealloc_arg serial_log qmp_sock pidfile
   local machine_arg memory_arg cxl_fmw_mib cxl_fmw_size_arg
+  local node0_mib node1_mib node2_mib node3_mib
 
   [[ -n "${KERNEL_IMAGE}" ]] || die "--kernel is required"
   [[ -n "${ROOTFS_IMAGE}" ]] || die "--rootfs is required"
@@ -633,6 +699,11 @@ build_qemu_cmd() {
   [[ "${NET_DEVICE}" == "virtio-net-pci" || "${NET_DEVICE}" == "e1000" || "${NET_DEVICE}" == "rtl8139" ]] || die "--net-device must be virtio-net-pci, e1000, or rtl8139"
   [[ "${SSH_PORT}" =~ ^[0-9]+$ ]] || die "--ssh-port must be a number"
   normalize_slow_memory_mode
+  normalize_topology
+  if [[ "${TOPOLOGY}" == "two-socket-cxl" ]]; then
+    [[ "${SLOW_MEMORY_MODE}" == "host-cxl" ]] || die "two-socket-cxl requires --slow-memory-mode host-cxl"
+    apply_two_socket_cxl_defaults
+  fi
   [[ "${MEMORY_SLOTS}" =~ ^[0-9]+$ ]] || die "--memory-slots must be a number"
   [[ "${HMAT_FAST_LATENCY_NS}" =~ ^[0-9]+$ ]] || die "--hmat-fast-latency-ns must be a number"
   [[ "${HMAT_SLOW_LATENCY_NS}" =~ ^[0-9]+$ ]] || die "--hmat-slow-latency-ns must be a number"
@@ -645,11 +716,27 @@ build_qemu_cmd() {
   if [[ "${DRY_RUN}" != "1" ]] && port_in_use "${SSH_PORT}"; then
     die "host SSH forward port already in use: ${SSH_PORT}"
   fi
+  if [[ "${DRY_RUN}" != "1" && "${TOPOLOGY}" == "two-socket-cxl" ]]; then
+    validate_host_node_spec "${NODE0_HOST_NODE}"
+    validate_host_node_spec "${NODE1_HOST_NODE}"
+    validate_host_node_spec "${NODE2_HOST_NODE}"
+    validate_host_node_spec "${NODE3_HOST_NODE}"
+  fi
 
   mkdir -p "${RUN_DIR}"
   fast_mib="$(size_to_mib "${FAST_MEM}")"
   slow_mib="$(size_to_mib "${SLOW_MEM}")"
-  if [[ -n "${TOTAL_MEM}" ]]; then
+  if [[ "${TOPOLOGY}" == "two-socket-cxl" ]]; then
+    node0_mib="$(size_to_mib "${NODE0_MEM}")"
+    node1_mib="$(size_to_mib "${NODE1_MEM}")"
+    node2_mib="$(size_to_mib "${NODE2_MEM}")"
+    node3_mib="$(size_to_mib "${NODE3_MEM}")"
+    if [[ -n "${TOTAL_MEM}" ]]; then
+      total_mib="$(size_to_mib "${TOTAL_MEM}")"
+    else
+      total_mib="$((node0_mib + node1_mib + node2_mib + node3_mib))"
+    fi
+  elif [[ -n "${TOTAL_MEM}" ]]; then
     total_mib="$(size_to_mib "${TOTAL_MEM}")"
   else
     total_mib="$((fast_mib + slow_mib))"
@@ -702,41 +789,57 @@ build_qemu_cmd() {
     -drive "file=${ROOTFS_IMAGE},if=${DRIVE_IF},format=${ROOTFS_FORMAT}"
     -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22"
     -device "${NET_DEVICE},netdev=net0"
-    -object "memory-backend-ram,id=ram0,size=${FAST_MEM},host-nodes=${FAST_HOST_NODE},policy=bind,${prealloc_arg}"
-    -numa "node,nodeid=0,cpus=${GUEST_NODE0_CPUS},memdev=ram0"
     -display none
     -serial "file:${SERIAL_LOG}"
     -monitor none
     -qmp "unix:${QMP_SOCK},server=on,wait=off"
   )
 
-  case "${SLOW_MEMORY_MODE}" in
-    numa)
-      QEMU_CMD+=(
-        -object "memory-backend-ram,id=ram1,size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,${prealloc_arg}"
-        -numa "node,nodeid=1,memdev=ram1"
-      )
-      ;;
-    host-cxl)
-      QEMU_CMD+=(
-        -object "memory-backend-ram,id=ram1,size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,${prealloc_arg}"
-        -numa "node,nodeid=1,memdev=ram1,initiator=0"
-      )
-      append_hmat_lb_args
-      ;;
-    qemu-cxl)
-      QEMU_CMD+=(
-        -numa "node,nodeid=1,initiator=0"
-      )
-      append_hmat_lb_args
-      QEMU_CMD+=(
-        -object "memory-backend-ram,id=${CXL_MEMDEV_ID},size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,share=on,${prealloc_arg}"
-        -device "pxb-cxl,bus_nr=${CXL_BUS_NR},bus=pcie.0,id=${CXL_BRIDGE_ID},numa_node=1"
-        -device "cxl-rp,port=${CXL_PORT},bus=${CXL_BRIDGE_ID},id=${CXL_ROOT_PORT_ID},chassis=${CXL_CHASSIS},slot=${CXL_SLOT}"
-        -device "cxl-type3,bus=${CXL_ROOT_PORT_ID},volatile-memdev=${CXL_MEMDEV_ID},id=${CXL_DEVICE_ID}"
-      )
-      ;;
-  esac
+  if [[ "${TOPOLOGY}" == "two-socket-cxl" ]]; then
+    QEMU_CMD+=(
+      -object "memory-backend-ram,id=ram0,size=${NODE0_MEM},host-nodes=${NODE0_HOST_NODE},policy=bind,${prealloc_arg}"
+      -object "memory-backend-ram,id=ram1,size=${NODE1_MEM},host-nodes=${NODE1_HOST_NODE},policy=bind,${prealloc_arg}"
+      -object "memory-backend-ram,id=ram2,size=${NODE2_MEM},host-nodes=${NODE2_HOST_NODE},policy=bind,${prealloc_arg}"
+      -object "memory-backend-ram,id=ram3,size=${NODE3_MEM},host-nodes=${NODE3_HOST_NODE},policy=bind,${prealloc_arg}"
+      -numa "node,nodeid=0,cpus=${GUEST_NODE0_CPUS},memdev=ram0"
+      -numa "node,nodeid=1,cpus=${GUEST_NODE1_CPUS},memdev=ram1"
+      -numa "node,nodeid=2,memdev=ram2,initiator=0"
+      -numa "node,nodeid=3,memdev=ram3,initiator=1"
+    )
+    append_hmat_lb_args_two_socket_cxl
+  else
+    QEMU_CMD+=(
+      -object "memory-backend-ram,id=ram0,size=${FAST_MEM},host-nodes=${FAST_HOST_NODE},policy=bind,${prealloc_arg}"
+      -numa "node,nodeid=0,cpus=${GUEST_NODE0_CPUS},memdev=ram0"
+    )
+    case "${SLOW_MEMORY_MODE}" in
+      numa)
+        QEMU_CMD+=(
+          -object "memory-backend-ram,id=ram1,size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,${prealloc_arg}"
+          -numa "node,nodeid=1,memdev=ram1"
+        )
+        ;;
+      host-cxl)
+        QEMU_CMD+=(
+          -object "memory-backend-ram,id=ram1,size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,${prealloc_arg}"
+          -numa "node,nodeid=1,memdev=ram1,initiator=0"
+        )
+        append_hmat_lb_args
+        ;;
+      qemu-cxl)
+        QEMU_CMD+=(
+          -numa "node,nodeid=1,initiator=0"
+        )
+        append_hmat_lb_args
+        QEMU_CMD+=(
+          -object "memory-backend-ram,id=${CXL_MEMDEV_ID},size=${SLOW_MEM},host-nodes=${SLOW_HOST_NODE},policy=bind,share=on,${prealloc_arg}"
+          -device "pxb-cxl,bus_nr=${CXL_BUS_NR},bus=pcie.0,id=${CXL_BRIDGE_ID},numa_node=1"
+          -device "cxl-rp,port=${CXL_PORT},bus=${CXL_BRIDGE_ID},id=${CXL_ROOT_PORT_ID},chassis=${CXL_CHASSIS},slot=${CXL_SLOT}"
+          -device "cxl-type3,bus=${CXL_ROOT_PORT_ID},volatile-memdev=${CXL_MEMDEV_ID},id=${CXL_DEVICE_ID}"
+        )
+        ;;
+    esac
+  fi
 
   if [[ -n "${INITRD_IMAGE}" ]]; then
     QEMU_CMD+=( -initrd "${INITRD_IMAGE}" )
@@ -779,9 +882,23 @@ QEMU launch plan
   accel      : ${ACCEL}
   host CPUs  : ${HOST_CPUS:-<not pinned>}
   guest CPUs : ${GUEST_CPUS}
+  topology   : ${TOPOLOGY}
   slow mode  : ${SLOW_MEMORY_MODE}
+EOF
+  if [[ "${TOPOLOGY}" == "two-socket-cxl" ]]; then
+    cat <<EOF
+  node0      : guest cpus=${GUEST_NODE0_CPUS}, mem=${NODE0_MEM}, host node=${NODE0_HOST_NODE}
+  node1      : guest cpus=${GUEST_NODE1_CPUS}, mem=${NODE1_MEM}, host node=${NODE1_HOST_NODE}
+  node2      : memory-only, mem=${NODE2_MEM}, host CXL node=${NODE2_HOST_NODE}, initiator=0
+  node3      : memory-only, mem=${NODE3_MEM}, host CXL node=${NODE3_HOST_NODE}, initiator=1
+EOF
+  else
+    cat <<EOF
   node0      : guest cpus=${GUEST_NODE0_CPUS}, mem=${FAST_MEM}, host node=${FAST_HOST_NODE}
   node1      : ${node1_desc}
+EOF
+  fi
+  cat <<EOF
   ssh        : host ${SSH_PORT} -> guest 22
   pidfile    : ${PIDFILE}
   serial log : ${SERIAL_LOG}
@@ -834,6 +951,7 @@ parse_ssh_args() {
   SSH_KEY_EXPLICIT="0"
   SSH_HOST_ARG="127.0.0.1"
   SSH_VM_NAME="${DEFAULT_VM_NAME}"
+  SSH_EXPECT_TOPOLOGY=""
   SSH_COMMAND=()
 
   while [[ $# -gt 0 ]]; do
@@ -843,6 +961,7 @@ parse_ssh_args() {
       --ssh-key|--key) require_value "$1" "${2:-}"; SSH_KEY_ARG="$2"; SSH_KEY_EXPLICIT="1"; shift 2 ;;
       --host) require_value "$1" "${2:-}"; SSH_HOST_ARG="$2"; shift 2 ;;
       --name) require_value "$1" "${2:-}"; SSH_VM_NAME="$2"; shift 2 ;;
+      --expect-topology) require_value "$1" "${2:-}"; SSH_EXPECT_TOPOLOGY="$2"; shift 2 ;;
       --) shift; SSH_COMMAND=( "$@" ); break ;;
       -h|--help) usage; exit 0 ;;
       *) SSH_COMMAND+=( "$1" ); shift ;;
@@ -1009,7 +1128,13 @@ if [[ -n "${DEMOTION_ENABLED}" && -w /sys/kernel/mm/numa/demotion_enabled ]]; th
 fi
 
 if [[ -n "${DEMOTION_TARGET}" && -w /sys/kernel/mm/numa/demotion_target ]]; then
-  echo "${DEMOTION_TARGET}" > /sys/kernel/mm/numa/demotion_target
+  IFS=';' read -ra demotion_pairs <<< "${DEMOTION_TARGET}"
+  for pair in "${demotion_pairs[@]}"; do
+    pair="${pair#"${pair%%[![:space:]]*}"}"
+    pair="${pair%"${pair##*[![:space:]]}"}"
+    [[ -n "${pair}" ]] || continue
+    echo "${pair}" > /sys/kernel/mm/numa/demotion_target
+  done
 fi
 
 if [[ -n "${SCAN_SIZE_MB}" && -w /sys/kernel/debug/sched/numa_balancing/scan_size_mb ]]; then
@@ -1083,7 +1208,7 @@ cmd_tmux_run() {
 }
 
 cmd_status() {
-  local name="${DEFAULT_VM_NAME}" pidfile
+  local name="${DEFAULT_VM_NAME}" pidfile pid=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) require_value "$1" "${2:-}"; name="$2"; shift 2 ;;
@@ -1094,9 +1219,15 @@ cmd_status() {
   pidfile="${RUN_DIR}/${name}.pid"
   log "name=${name}"
   log "pidfile=${pidfile}"
-  if [[ -s "${pidfile}" ]] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
-    log "running pid=$(cat "${pidfile}")"
-    ps -o pid,psr,comm,args -p "$(cat "${pidfile}")"
+  if [[ -r "${pidfile}" && -s "${pidfile}" ]]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${pid}" ]]; then
+    pid="$(pgrep -f "qemu-system.*-name ${name}" | head -n 1 || true)"
+  fi
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+    log "running pid=${pid}"
+    ps -o pid,psr,comm,args -p "${pid}"
   else
     log "not running"
   fi
@@ -1113,8 +1244,13 @@ cmd_stop() {
     esac
   done
   pidfile="${RUN_DIR}/${name}.pid"
-  [[ -s "${pidfile}" ]] || die "pidfile not found: ${pidfile}"
-  pid="$(cat "${pidfile}")"
+  if [[ -r "${pidfile}" && -s "${pidfile}" ]]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${pid}" ]]; then
+    pid="$(pgrep -f "qemu-system.*-name ${name}" | head -n 1 || true)"
+  fi
+  [[ -n "${pid}" ]] || die "pidfile not found and QEMU process not found for ${name}"
   if kill -0 "${pid}" 2>/dev/null; then
     log "stopping ${name} pid=${pid}"
     kill -TERM "${pid}"
@@ -1127,17 +1263,18 @@ cmd_stop() {
       kill -KILL "${pid}" 2>/dev/null || true
     fi
   fi
-  rm -f "${pidfile}"
+  rm -f "${pidfile}" 2>/dev/null || true
 }
 
 cmd_verify_placement() {
-  local name pidfile pid
+  local name pidfile pid=""
   parse_ssh_args "$@"
   name="${SSH_VM_NAME}"
   pidfile="${RUN_DIR}/${name}.pid"
-  if [[ -s "${pidfile}" ]]; then
-    pid="$(cat "${pidfile}")"
-  else
+  if [[ -r "${pidfile}" && -s "${pidfile}" ]]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${pid}" ]]; then
     pid="$(pgrep -f "qemu-system.*-name ${name}" | head -n 1 || true)"
   fi
   [[ -n "${pid}" ]] || die "QEMU pid not found for ${name}"
@@ -1150,7 +1287,61 @@ cmd_verify_placement() {
 
   log "guest NUMA topology"
   cmd_ssh --ssh-user "${SSH_USER_ARG}" --ssh-port "${SSH_PORT_ARG}" --ssh-key "${SSH_KEY_ARG}" --host "${SSH_HOST_ARG}" -- \
-    "numactl -H 2>/dev/null || true; for n in /sys/devices/system/node/node*/meminfo; do echo === \$n; sed -n '1,6p' \$n; done"
+    "EXPECT_TOPOLOGY=$(q "${SSH_EXPECT_TOPOLOGY}") bash -s" <<'EOS'
+set -euo pipefail
+
+numactl -H 2>/dev/null || true
+for n in /sys/devices/system/node/node*/meminfo; do
+  echo "=== ${n}"
+  sed -n '1,6p' "${n}"
+done
+for n in /sys/devices/system/node/node*; do
+  [[ -d "${n}" ]] || continue
+  echo "=== ${n}/cpulist"
+  cat "${n}/cpulist" 2>/dev/null || true
+done
+if [[ -d /sys/kernel/mm/memory_tiering ]]; then
+  echo "=== memory tiers"
+  find /sys/kernel/mm/memory_tiering -maxdepth 3 -type f -print -exec cat {} \; 2>/dev/null || true
+fi
+if [[ -r /sys/kernel/mm/numa/demotion_target ]]; then
+  echo "=== demotion_target"
+  cat /sys/kernel/mm/numa/demotion_target
+fi
+if [[ -r /sys/kernel/mm/numa_balancing/local_fault_stats ]]; then
+  echo "=== local_fault_stats"
+  cat /sys/kernel/mm/numa_balancing/local_fault_stats
+fi
+
+if [[ "${EXPECT_TOPOLOGY}" == "two-socket-cxl" ]]; then
+  node0_cpus="$(cat /sys/devices/system/node/node0/cpulist 2>/dev/null || true)"
+  node1_cpus="$(cat /sys/devices/system/node/node1/cpulist 2>/dev/null || true)"
+  node2_cpus="$(cat /sys/devices/system/node/node2/cpulist 2>/dev/null || true)"
+  node3_cpus="$(cat /sys/devices/system/node/node3/cpulist 2>/dev/null || true)"
+  for node in 0 1 2 3; do
+    [[ -d "/sys/devices/system/node/node${node}" ]] || {
+      echo "missing guest node${node}" >&2
+      exit 1
+    }
+  done
+  [[ -n "${node0_cpus}" ]] || {
+    echo "node0 has no CPUs" >&2
+    exit 1
+  }
+  [[ -n "${node1_cpus}" ]] || {
+    echo "node1 has no CPUs" >&2
+    exit 1
+  }
+  if [[ -n "${node2_cpus}" ]]; then
+    echo "node2 unexpectedly has CPUs" >&2
+    exit 1
+  fi
+  if [[ -n "${node3_cpus}" ]]; then
+    echo "node3 unexpectedly has CPUs" >&2
+    exit 1
+  fi
+fi
+EOS
 }
 
 main() {
