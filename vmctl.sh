@@ -786,7 +786,7 @@ build_qemu_cmd() {
     -m "${memory_arg}"
     -kernel "${KERNEL_IMAGE}"
     -append "${CMDLINE}"
-    -drive "file=${ROOTFS_IMAGE},if=${DRIVE_IF},format=${ROOTFS_FORMAT}"
+    -drive "file=${ROOTFS_IMAGE},if=${DRIVE_IF},format=${ROOTFS_FORMAT},cache=none,aio=native"
     -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22"
     -device "${NET_DEVICE},netdev=net0"
     -display none
